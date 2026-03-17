@@ -386,6 +386,65 @@ function convertToSimpleHandle(handle: string, blockId: string, block: BlockStat
 }
 
 /**
+ * Build a deterministic mapping from UUID block IDs to human-readable keys.
+ * Uses the block type as the base key, appending a 1-based index when
+ * multiple blocks share the same type (e.g. agent_1, agent_2).
+ * The starter block always maps to "start".
+ */
+function buildBlockKeyMap(blocks: Record<string, BlockState>): Map<string, string> {
+  const keyMap = new Map<string, string>()
+  const typeCounts = new Map<string, number>()
+
+  // First pass: count blocks per type (excluding the starter block)
+  for (const [blockId, block] of Object.entries(blocks)) {
+    if (blockId === 'start' || block.type === 'starter') {
+      continue
+    }
+    typeCounts.set(block.type, (typeCounts.get(block.type) || 0) + 1)
+  }
+
+  // Second pass: assign readable keys
+  const typeIndex = new Map<string, number>()
+  for (const [blockId, block] of Object.entries(blocks)) {
+    if (blockId === 'start' || block.type === 'starter') {
+      keyMap.set(blockId, 'start')
+      continue
+    }
+
+    const count = typeCounts.get(block.type) || 1
+    if (count === 1) {
+      // Only one block of this type — use the type directly
+      keyMap.set(blockId, block.type)
+    } else {
+      // Multiple blocks of the same type — append 1-based index
+      const idx = (typeIndex.get(block.type) || 0) + 1
+      typeIndex.set(block.type, idx)
+      keyMap.set(blockId, `${block.type}_${idx}`)
+    }
+  }
+
+  return keyMap
+}
+
+/**
+ * Remap connection targets from UUID to human-readable key.
+ */
+function remapConnectionTargets(
+  connections: Record<string, string | string[]>,
+  keyMap: Map<string, string>
+): Record<string, string | string[]> {
+  const remapped: Record<string, string | string[]> = {}
+  for (const [handle, targets] of Object.entries(connections)) {
+    if (Array.isArray(targets)) {
+      remapped[handle] = targets.map((t) => keyMap.get(t) || t)
+    } else {
+      remapped[handle] = keyMap.get(targets) || targets
+    }
+  }
+  return remapped
+}
+
+/**
  * Extract connections for a block from edges and format as operations-style connections
  * Converts internal UUID handles to semantic format for training data
  */
@@ -434,6 +493,9 @@ export function sanitizeForCopilot(state: WorkflowState): CopilotWorkflowState {
   const sanitizedBlocks: Record<string, CopilotBlockState> = {}
   const processedBlocks = new Set<string>()
 
+  // Build a UUID → human-readable key mapping for all blocks
+  const keyMap = buildBlockKeyMap(state.blocks)
+
   // Helper to find child blocks of a parent (loop/parallel container)
   const findChildBlocks = (parentId: string): string[] => {
     return Object.keys(state.blocks).filter(
@@ -443,7 +505,12 @@ export function sanitizeForCopilot(state: WorkflowState): CopilotWorkflowState {
 
   // Helper to recursively sanitize a block and its children
   const sanitizeBlock = (blockId: string, block: BlockState): CopilotBlockState => {
-    const connections = extractConnectionsForBlock(blockId, state.edges, block)
+    let connections = extractConnectionsForBlock(blockId, state.edges, block)
+
+    // Remap connection targets from UUID to readable key
+    if (connections) {
+      connections = remapConnectionTargets(connections, keyMap)
+    }
 
     // For loop/parallel blocks, extract config from block.data instead of subBlocks
     let inputs: Record<string, string | number | string[][] | object>
@@ -491,11 +558,12 @@ export function sanitizeForCopilot(state: WorkflowState): CopilotWorkflowState {
     const nestedNodes: Record<string, CopilotBlockState> = {}
 
     if (childBlockIds.length > 0) {
-      // Recursively sanitize child blocks
+      // Recursively sanitize child blocks using readable keys
       childBlockIds.forEach((childId) => {
         const childBlock = state.blocks[childId]
         if (childBlock) {
-          nestedNodes[childId] = sanitizeBlock(childId, childBlock)
+          const childKey = keyMap.get(childId) || childId
+          nestedNodes[childKey] = sanitizeBlock(childId, childBlock)
           processedBlocks.add(childId)
         }
       })
@@ -528,7 +596,8 @@ export function sanitizeForCopilot(state: WorkflowState): CopilotWorkflowState {
     // Skip if it has a parent (it will be processed as nested)
     if (block.data?.parentId) return
 
-    sanitizedBlocks[blockId] = sanitizeBlock(blockId, block)
+    const readableKey = keyMap.get(blockId) || blockId
+    sanitizedBlocks[readableKey] = sanitizeBlock(blockId, block)
   })
 
   return {
